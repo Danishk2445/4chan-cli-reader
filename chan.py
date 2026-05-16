@@ -1,457 +1,395 @@
 #!/usr/bin/env python3
-"""
-4chan CLI Reader — browse boards, catalogs, and threads from the terminal.
-Read-only. No images. No posting.
+"""4chan CLI reader — browse boards, catalogs, and threads in your terminal.
 
-Usage:
-    python chan.py
+Read-only. No posting. Images are surfaced as URLs.
 """
 
 import sys
-import datetime
 
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.text import Text
-from rich.prompt import Prompt, IntPrompt
-from rich.columns import Columns
-from rich.rule import Rule
-from rich.theme import Theme
+import requests
 from rich import box
+from rich.columns import Columns
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
 
 import api
 import utils
 
-# ── Theme ────────────────────────────────────────────────────────────────────
-CUSTOM_THEME = Theme(
+
+THEME = Theme(
     {
         "board.name": "bold #81a1c1",
         "board.title": "#d8dee9",
-        "board.nsfw": "bold #bf616a",
         "board.sfw": "bold #a3be8c",
+        "board.nsfw": "bold #bf616a",
         "thread.no": "bold #88c0d0",
         "thread.subject": "bold #ebcb8b",
         "thread.name": "bold #a3be8c",
-        "thread.date": "dim #4c566a",
         "thread.stats": "#5e81ac",
+        "thread.date": "dim #4c566a",
         "greentext": "#a3be8c",
         "quotelink": "#88c0d0 underline",
         "spoiler": "on #3b4252",
         "post.op": "bold #d08770",
         "post.id": "bold #88c0d0",
+        "image.url": "#b48ead underline",
+        "header": "bold #eceff4",
         "info": "italic #616e88",
         "prompt": "bold #81a1c1",
         "error": "bold #bf616a",
-        "header": "bold #eceff4",
     }
 )
 
-console = Console(theme=CUSTOM_THEME)
+console = Console(theme=THEME)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── small renderers ─────────────────────────────────────────────────────────
 
 
-def _timestamp_to_str(ts: int) -> str:
-    """Unix timestamp → readable date string."""
-    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+def _header():
+    title = Text("  4chan CLI Reader  ", style="header")
+    sub = Text("read-only · no posting", style="info")
+    console.print(Panel(Group(title, sub), border_style="#5e81ac", box=box.DOUBLE, padding=(0, 2)))
 
 
-def _truncate(text: str, length: int = 120) -> str:
-    """Truncate text to *length* characters, adding ellipsis if needed."""
-    text = text.replace("\n", " ")
-    if len(text) <= length:
-        return text
-    return text[: length - 1] + "…"
-
-
-def _format_comment(raw_comment: str) -> Text:
-    """Convert raw HTML comment to a Rich Text with greentext styling."""
-    plain = utils.clean_comment(raw_comment)
-    rich_text = Text()
+def _format_comment(plain: str) -> Text:
+    out = Text()
     for line in plain.split("\n"):
-        if line.startswith(">") and not line.startswith(">>"):
-            rich_text.append(line + "\n", style="greentext")
-        elif line.startswith(">>"):
-            rich_text.append(line + "\n", style="quotelink")
+        if line.startswith(">>"):
+            line_style: str | None = "quotelink"
+        elif line.startswith(">"):
+            line_style = "greentext"
         else:
-            rich_text.append(line + "\n")
-    # strip trailing newline
-    if rich_text.plain.endswith("\n"):
-        rich_text.right_crop(1)
-    return rich_text
+            line_style = None
+
+        i = 0
+        while i < len(line):
+            start = line.find("[spoiler]", i)
+            if start == -1:
+                out.append(line[i:], style=line_style)
+                break
+            end = line.find("[/spoiler]", start)
+            if end == -1:
+                out.append(line[i:], style=line_style)
+                break
+            out.append(line[i:start], style=line_style)
+            out.append(line[start + len("[spoiler]") : end], style="spoiler")
+            i = end + len("[/spoiler]")
+        out.append("\n")
+
+    if out.plain.endswith("\n"):
+        out.right_crop(1)
+    return out
 
 
-def _print_header():
-    """Print the application header."""
-    header = Text()
-    header.append("  ╔═══════════════════════════════════════╗\n", style="bold #5e81ac")
-    header.append("  ║", style="bold #5e81ac")
-    header.append("   4chan CLI Reader", style="bold #88c0d0")
-    header.append("                    ", style="bold #5e81ac")
-    header.append("║\n", style="bold #5e81ac")
-    header.append("  ║", style="bold #5e81ac")
-    header.append("   Read-only · No images · No posting", style="dim #4c566a")
-    header.append("  ║\n", style="bold #5e81ac")
-    header.append("  ╚═══════════════════════════════════════╝", style="bold #5e81ac")
-    console.print(header)
-    console.print()
+def _post_panel(board: str, post: dict, is_op: bool) -> Panel:
+    head = Text()
+    head.append(f"No.{post['no']}", style="post.op" if is_op else "post.id")
+    name = post.get("name", "Anonymous") or "Anonymous"
+    head.append(f"  {name}", style="thread.name")
+    if "now" in post:
+        head.append(f"  {post['now']}", style="thread.date")
+    elif "time" in post:
+        head.append(f"  {utils.timestamp(post['time'])}", style="thread.date")
+
+    parts: list = [head]
+
+    if is_op:
+        subject = post.get("sub")
+        if subject:
+            parts.append(Text(subject, style="thread.subject"))
+
+    img = utils.image_url(board, post)
+    if img:
+        url_line = Text()
+        filename = post.get("filename", "") + post.get("ext", "")
+        if filename:
+            url_line.append(f"📎 {filename}  ", style="info")
+        url_line.append(img, style="image.url")
+        parts.append(url_line)
+
+    body = utils.clean_comment(post.get("com"))
+    if body:
+        parts.append(_format_comment(body))
+
+    return Panel(
+        Group(*parts),
+        border_style="#d08770" if is_op else "#3b4252",
+        box=box.ROUNDED,
+        padding=(0, 1),
+        title="[post.op]OP[/post.op]" if is_op else None,
+        title_align="left",
+    )
 
 
-# ── Screens ──────────────────────────────────────────────────────────────────
+def _ask(prompt_text: str) -> str:
+    try:
+        return Prompt.ask(f"  [prompt]{prompt_text}[/prompt]").strip()
+    except (EOFError, KeyboardInterrupt):
+        return "q"
+
+
+def _api_call(label: str, fn, *args):
+    """Run an api call with a status spinner and standard error handling.
+
+    Returns the result, or None on failure (with the error already printed).
+    """
+    try:
+        with console.status(f"[info]{label}…[/info]", spinner="dots"):
+            return fn(*args)
+    except requests.HTTPError as e:
+        console.print(f"  [error]HTTP {e.response.status_code}: {e.response.reason}[/error]")
+    except requests.RequestException as e:
+        console.print(f"  [error]Network error: {e}[/error]")
+    return None
+
+
+# ── screens ─────────────────────────────────────────────────────────────────
 
 
 def show_boards():
-    """Display all boards grouped by category and let user pick one."""
     console.clear()
-    _print_header()
+    _header()
 
-    console.print("  [info]Loading boards…[/info]")
-    try:
-        boards = api.get_boards()
-    except Exception as e:
-        console.print(f"  [error]Failed to load boards: {e}[/error]")
-        return
+    boards = _api_call("Loading boards", api.get_boards)
+    if boards is None:
+        _ask("Press Enter to retry, or q to quit")
+        return ("boards", None)
 
     sfw = [b for b in boards if b.get("ws_board") == 1]
     nsfw = [b for b in boards if b.get("ws_board") == 0]
 
-    console.clear()
-    _print_header()
+    def render_section(items: list[dict], rule_label: str, rule_style: str):
+        console.print(Rule(f"[{rule_style}]  {rule_label}  [/{rule_style}]", style=rule_style.split()[-1]))
+        console.print()
+        cells = []
+        for b in items:
+            t = Text()
+            t.append(f"/{b['board']}/", style="board.name")
+            t.append(f" {b['title']}", style="board.title")
+            cells.append(t)
+        console.print(Columns(cells, padding=(0, 3), equal=True, expand=True, column_first=True))
+        console.print()
 
-    # ── SFW boards ──
-    console.print(Rule("[board.sfw]  Safe-For-Work Boards  [/board.sfw]", style="#a3be8c"))
-    console.print()
-
-    sfw_items = []
-    for b in sfw:
-        txt = Text()
-        txt.append(f"/{b['board']}/", style="board.name")
-        txt.append(f" {b['title']}", style="board.title")
-        sfw_items.append(txt)
-
-    console.print(Columns(sfw_items, column_first=True, padding=(0, 3), equal=True, width=32))
-    console.print()
-
-    # ── NSFW boards ──
-    console.print(Rule("[board.nsfw]  NSFW Boards  [/board.nsfw]", style="#bf616a"))
-    console.print()
-
-    nsfw_items = []
-    for b in nsfw:
-        txt = Text()
-        txt.append(f"/{b['board']}/", style="board.name")
-        txt.append(f" {b['title']}", style="board.title")
-        nsfw_items.append(txt)
-
-    console.print(Columns(nsfw_items, column_first=True, padding=(0, 3), equal=True, width=32))
-    console.print()
-
-    # ── Prompt ──
-    console.print(Rule(style="dim"))
-    board_name = Prompt.ask(
-        "  [prompt]Enter board name (e.g. g, a, pol) or 'q' to quit[/prompt]"
-    )
-    if board_name.lower() in ("q", "quit", "exit"):
-        return
-    board_name = board_name.strip().strip("/")
+    render_section(sfw, "Safe-For-Work boards", "board.sfw")
+    render_section(nsfw, "NSFW boards", "board.nsfw")
 
     valid = {b["board"] for b in boards}
-    if board_name not in valid:
-        console.print(f"  [error]Board /{board_name}/ not found.[/error]")
-        Prompt.ask("  [info]Press Enter to continue[/info]")
-        show_boards()
-        return
+    while True:
+        choice = _ask("board name (e.g. g) · q to quit")
+        if choice.lower() in ("q", "quit", "exit"):
+            return ("quit", None)
+        choice = choice.strip().strip("/").lower()
+        if choice in valid:
+            return ("catalog", choice)
+        console.print(f"  [error]board /{choice}/ not found.[/error]")
 
-    show_catalog(board_name)
 
+def show_catalog(board: str):
+    page_idx = 0
+    catalog = None
+    threads: list[dict] = []
 
-def show_catalog(board: str, page_idx: int = 0):
-    """Display the catalog for a board and let user pick a thread."""
-    console.clear()
-    _print_header()
+    while True:
+        if catalog is None:
+            console.clear()
+            _header()
+            catalog = _api_call(f"Loading /{board}/ catalog", api.get_catalog, board)
+            if catalog is None:
+                _ask("Press Enter to go back to boards")
+                return ("boards", None)
+            threads = [t for page in catalog for t in page.get("threads", [])]
+            if not threads:
+                console.print(f"  [error]/{board}/ has no threads.[/error]")
+                _ask("Press Enter to go back")
+                return ("boards", None)
 
-    console.print(f"  [info]Loading /{board}/ catalog…[/info]")
-    try:
-        catalog = api.get_catalog(board)
-    except Exception as e:
-        console.print(f"  [error]Failed to load catalog: {e}[/error]")
-        Prompt.ask("  [info]Press Enter to go back[/info]")
-        show_boards()
-        return
+        page_size = 20
+        total_pages = (len(threads) + page_size - 1) // page_size
+        page_idx = max(0, min(page_idx, total_pages - 1))
+        start = page_idx * page_size
+        page_threads = threads[start : start + page_size]
 
-    # Flatten all threads across pages, keeping page info
-    all_threads = []
-    for page in catalog:
-        for thread in page.get("threads", []):
-            thread["_page"] = page.get("page", 0)
-            all_threads.append(thread)
+        console.clear()
+        _header()
 
-    if not all_threads:
-        console.print(f"  [error]No threads found on /{board}/.[/error]")
-        Prompt.ask("  [info]Press Enter to go back[/info]")
-        show_boards()
-        return
+        title = Text()
+        title.append(f"  /{board}/", style="board.name")
+        title.append("  catalog  ", style="header")
+        title.append(f"page {page_idx + 1}/{total_pages}", style="info")
+        console.print(title)
+        console.print()
 
-    # Paginate display: 20 threads per screen
-    page_size = 20
-    total_pages = (len(all_threads) + page_size - 1) // page_size
-    page_idx = max(0, min(page_idx, total_pages - 1))
+        table = Table(
+            box=box.ROUNDED,
+            border_style="#3b4252",
+            header_style="bold #81a1c1",
+            row_styles=["", "on #2e3440"],
+            pad_edge=False,
+            padding=(0, 1),
+            expand=True,
+        )
+        table.add_column("#", style="dim", width=4, justify="right")
+        table.add_column("No.", style="thread.no", width=11)
+        table.add_column("Subject / comment", style="board.title", ratio=1, overflow="fold")
+        table.add_column("R", style="thread.stats", width=5, justify="right")
+        table.add_column("I", style="thread.stats", width=5, justify="right")
+        table.add_column("Date", style="thread.date", width=16)
 
-    start = page_idx * page_size
-    end = min(start + page_size, len(all_threads))
-    page_threads = all_threads[start:end]
+        for i, t in enumerate(page_threads, start=start + 1):
+            sub = t.get("sub", "")
+            com = utils.clean_comment(t.get("com", ""))
+            display = sub if sub else com
+            if not display:
+                display = "(no text)"
+            table.add_row(
+                str(i),
+                str(t["no"]),
+                utils.truncate(display, 120),
+                str(t.get("replies", 0)),
+                str(t.get("images", 0)),
+                utils.timestamp(t.get("time", 0)),
+            )
 
-    console.clear()
-    _print_header()
+        console.print(table)
+        console.print()
 
-    title_text = Text()
-    title_text.append(f"  /{board}/ ", style="board.name")
-    title_text.append(f"— Catalog", style="header")
-    title_text.append(f"  (page {page_idx + 1}/{total_pages})", style="info")
-    console.print(title_text)
-    console.print()
+        hints = []
+        if page_idx > 0:
+            hints.append("[prompt]p[/prompt]=prev")
+        if page_idx < total_pages - 1:
+            hints.append("[prompt]n[/prompt]=next")
+        hints.append("[prompt]#[/prompt]=open row")
+        hints.append("[prompt]t <id>[/prompt]=open by no.")
+        hints.append("[prompt]b[/prompt]=boards")
+        hints.append("[prompt]q[/prompt]=quit")
+        console.print("  " + "  ·  ".join(hints), style="info")
+        console.print()
 
-    # Thread table
-    table = Table(
-        box=box.ROUNDED,
-        border_style="#3b4252",
-        header_style="bold #81a1c1",
-        row_styles=["", "on #2e3440"],
-        pad_edge=True,
-        padding=(0, 1),
-    )
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("No.", style="thread.no", width=12)
-    table.add_column("Subject / Comment", style="board.title", ratio=1)
-    table.add_column("R", style="thread.stats", width=5, justify="right")
-    table.add_column("Date", style="thread.date", width=20)
-
-    for i, t in enumerate(page_threads, start=start + 1):
-        subject = t.get("sub", "")
-        comment = utils.clean_comment(t.get("com", ""))
-        display = subject if subject else _truncate(comment, 80)
-        if not display:
-            display = "(no text)"
-
-        replies = str(t.get("replies", 0))
-        date = _timestamp_to_str(t.get("time", 0))
-
-        table.add_row(str(i), str(t["no"]), _truncate(display, 80), replies, date)
-
-    console.print(table)
-    console.print()
-
-    # Navigation
-    nav_parts = []
-    if page_idx > 0:
-        nav_parts.append("[prompt]p[/prompt]=prev page")
-    if page_idx < total_pages - 1:
-        nav_parts.append("[prompt]n[/prompt]=next page")
-    nav_parts.append("[prompt]#[/prompt]=open thread by row number")
-    nav_parts.append("[prompt]t <id>[/prompt]=open by thread ID")
-    nav_parts.append("[prompt]b[/prompt]=back to boards")
-    nav_parts.append("[prompt]q[/prompt]=quit")
-    console.print("  " + "  │  ".join(nav_parts), style="info")
-    console.print()
-
-    choice = Prompt.ask("  [prompt]>[/prompt]").strip().lower()
-
-    if choice == "q":
-        return
-    elif choice == "b":
-        show_boards()
-        return
-    elif choice == "n" and page_idx < total_pages - 1:
-        show_catalog(board, page_idx + 1)
-        return
-    elif choice == "p" and page_idx > 0:
-        show_catalog(board, page_idx - 1)
-        return
-    elif choice.startswith("t "):
-        try:
-            thread_no = int(choice.split()[1])
-            show_thread(board, thread_no)
-            show_catalog(board, page_idx)
-            return
-        except (ValueError, IndexError):
-            console.print("  [error]Invalid thread ID.[/error]")
-            Prompt.ask("  [info]Press Enter[/info]")
-            show_catalog(board, page_idx)
-            return
-    else:
-        try:
+        choice = _ask(">").lower()
+        if choice in ("q", "quit", "exit"):
+            return ("quit", None)
+        if choice in ("b", "back"):
+            return ("boards", None)
+        if choice == "n" and page_idx < total_pages - 1:
+            page_idx += 1
+            continue
+        if choice == "p" and page_idx > 0:
+            page_idx -= 1
+            continue
+        if choice.startswith("t "):
+            try:
+                no = int(choice.split(maxsplit=1)[1])
+            except (ValueError, IndexError):
+                console.print("  [error]usage: t <thread-id>[/error]")
+                _ask("Press Enter to continue")
+                continue
+            return ("thread", (board, no))
+        if choice.isdigit():
             row = int(choice)
-            idx = row - 1
-            if 0 <= idx < len(all_threads):
-                show_thread(board, all_threads[idx]["no"])
-                show_catalog(board, page_idx)
-                return
-            else:
-                console.print("  [error]Row number out of range.[/error]")
-                Prompt.ask("  [info]Press Enter[/info]")
-                show_catalog(board, page_idx)
-                return
-        except ValueError:
-            console.print("  [error]Unrecognized command.[/error]")
-            Prompt.ask("  [info]Press Enter[/info]")
-            show_catalog(board, page_idx)
-            return
+            if start + 1 <= row <= start + len(page_threads):
+                return ("thread", (board, page_threads[row - start - 1]["no"]))
+            console.print(f"  [error]row {row} is not on this page.[/error]")
+            _ask("Press Enter to continue")
+            continue
+        console.print(f"  [error]unknown command: {choice!r}[/error]")
+        _ask("Press Enter to continue")
 
 
 def show_thread(board: str, thread_no: int):
-    """Display all posts in a thread with pagination."""
     console.clear()
-    _print_header()
+    _header()
 
-    console.print(f"  [info]Loading thread /{board}/{thread_no}…[/info]")
-    try:
-        data = api.get_thread(board, thread_no)
-    except Exception as e:
-        console.print(f"  [error]Failed to load thread: {e}[/error]")
-        Prompt.ask("  [info]Press Enter to go back[/info]")
-        return
+    data = _api_call(f"Loading /{board}/{thread_no}", api.get_thread, board, thread_no)
+    if data is None:
+        _ask("Press Enter to go back")
+        return ("catalog", board)
 
     posts = data.get("posts", [])
     if not posts:
-        console.print("  [error]Thread is empty.[/error]")
-        Prompt.ask("  [info]Press Enter to go back[/info]")
-        return
+        console.print("  [error]thread is empty.[/error]")
+        _ask("Press Enter to go back")
+        return ("catalog", board)
 
-    # Display with paging
-    page_size = 10
-    total_pages = (len(posts) + page_size - 1) // page_size
-    current_page = 0
+    page_size = 6
+    pages = [posts[i : i + page_size] for i in range(0, len(posts), page_size)]
+    page_idx = 0
 
     while True:
         console.clear()
-        _print_header()
+        _header()
 
-        op = posts[0]
-        op_subject = op.get("sub", "")
-        title_text = Text()
-        title_text.append(f"  /{board}/ ", style="board.name")
-        title_text.append(f"Thread No.{thread_no}", style="thread.no")
-        if op_subject:
-            title_text.append(f"  —  {op_subject}", style="thread.subject")
-        title_text.append(
-            f"  ({len(posts)} posts, page {current_page + 1}/{total_pages})", style="info"
+        title = Text()
+        title.append(f"  /{board}/", style="board.name")
+        title.append(f"  thread {thread_no}  ", style="header")
+        title.append(
+            f"{len(posts) - 1} repl{'y' if len(posts) == 2 else 'ies'}  ·  "
+            f"page {page_idx + 1}/{len(pages)}",
+            style="info",
         )
-        console.print(title_text)
+        console.print(title)
         console.print()
 
-        start = current_page * page_size
-        end = min(start + page_size, len(posts))
+        for post in pages[page_idx]:
+            is_op = post is posts[0]
+            console.print(_post_panel(board, post, is_op))
+            console.print()
 
-        for post in posts[start:end]:
-            _render_post(post, board, is_op=(post.get("resto", 0) == 0))
-
-        console.print()
-        # Navigation
-        nav_parts = []
-        if current_page > 0:
-            nav_parts.append("[prompt]p[/prompt]=prev")
-        if current_page < total_pages - 1:
-            nav_parts.append("[prompt]n[/prompt]=next")
-        nav_parts.append("[prompt]t[/prompt]=top")
-        nav_parts.append("[prompt]e[/prompt]=end")
-        nav_parts.append("[prompt]b[/prompt]=back to catalog")
-        nav_parts.append("[prompt]q[/prompt]=quit")
-        console.print("  " + "  │  ".join(nav_parts), style="info")
+        hints = []
+        if page_idx > 0:
+            hints.append("[prompt]p[/prompt]=prev")
+        if page_idx < len(pages) - 1:
+            hints.append("[prompt]n[/prompt]=next")
+        hints.append("[prompt]b[/prompt]=catalog")
+        hints.append("[prompt]q[/prompt]=quit")
+        console.print("  " + "  ·  ".join(hints), style="info")
         console.print()
 
-        choice = Prompt.ask("  [prompt]>[/prompt]").strip().lower()
-
-        if choice == "q":
-            sys.exit(0)
-        elif choice == "b":
-            return
-        elif choice == "n" and current_page < total_pages - 1:
-            current_page += 1
-        elif choice == "p" and current_page > 0:
-            current_page -= 1
-        elif choice == "t":
-            current_page = 0
-        elif choice == "e":
-            current_page = total_pages - 1
-        else:
-            pass  # stay on same page for unrecognized input
-
-
-def _render_post(post: dict, board: str, is_op: bool = False):
-    """Render a single post as a Rich Panel."""
-    post_no = post.get("no", 0)
-    name = post.get("name", "Anonymous")
-    trip = post.get("trip", "")
-    capcode = post.get("capcode", "")
-    date_str = post.get("now", "")
-    comment = post.get("com", "")
-    subject = post.get("sub", "")
-    country_name = post.get("country_name", "")
-    poster_id = post.get("id", "")
-
-    # Build header line
-    header = Text()
-    if is_op:
-        header.append("OP ", style="post.op")
-    header.append(f"No.{post_no}", style="post.id")
-    header.append("  ")
-    header.append(name, style="thread.name")
-    if trip:
-        header.append(f" {trip}", style="dim #b48ead")
-    if capcode:
-        header.append(f" ## {capcode}", style="bold #bf616a")
-    if poster_id:
-        header.append(f"  ID:{poster_id}", style="dim #d08770")
-    if country_name:
-        header.append(f"  [{country_name}]", style="dim #ebcb8b")
-    header.append(f"  {date_str}", style="thread.date")
-
-    # File info (just metadata, no actual image)
-    file_info = ""
-    if post.get("filename"):
-        fname = post["filename"] + post.get("ext", "")
-        fsize_kb = post.get("fsize", 0) // 1024
-        dims = f"{post.get('w', '?')}x{post.get('h', '?')}"
-        file_info = f"📎 {fname} ({fsize_kb}KB, {dims})"
-
-    # Build body
-    body = Text()
-    if subject and not is_op:
-        body.append(subject + "\n", style="thread.subject")
-    if file_info:
-        body.append(file_info + "\n", style="dim #5e81ac")
-        body.append("\n")
-    if comment:
-        body.append_text(_format_comment(comment))
-
-    border_style = "#5e81ac" if is_op else "#3b4252"
-    panel_box = box.HEAVY if is_op else box.ROUNDED
-
-    console.print(
-        Panel(
-            body,
-            title=header,
-            title_align="left",
-            border_style=border_style,
-            box=panel_box,
-            padding=(0, 2),
-            width=min(console.width - 4, 110),
-        )
-    )
+        choice = _ask(">").lower()
+        if choice in ("q", "quit", "exit"):
+            return ("quit", None)
+        if choice in ("b", "back"):
+            return ("catalog", board)
+        if choice == "n" and page_idx < len(pages) - 1:
+            page_idx += 1
+            continue
+        if choice == "p" and page_idx > 0:
+            page_idx -= 1
+            continue
+        if choice == "":
+            if page_idx < len(pages) - 1:
+                page_idx += 1
+            continue
+        console.print(f"  [error]unknown command: {choice!r}[/error]")
+        _ask("Press Enter to continue")
 
 
-# ── Entry ────────────────────────────────────────────────────────────────────
+# ── main loop ───────────────────────────────────────────────────────────────
 
 
 def main():
+    state: tuple = ("boards", None)
     try:
-        show_boards()
+        while state[0] != "quit":
+            kind, arg = state
+            if kind == "boards":
+                state = show_boards()
+            elif kind == "catalog":
+                state = show_catalog(arg)
+            elif kind == "thread":
+                board, no = arg
+                state = show_thread(board, no)
+            else:
+                break
     except KeyboardInterrupt:
-        console.print("\n  [info]Goodbye.[/info]")
-        sys.exit(0)
+        pass
+    console.print("\n[info]bye.[/info]")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
